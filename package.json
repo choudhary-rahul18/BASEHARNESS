@@ -1,0 +1,17 @@
+{
+  "name": "base-harness",
+  "version": "0.1.0",
+  "description": "Level 0 — BrowserContext agent using Playwright and TypeScript",
+  "type": "module",
+  "scripts": {
+    "start": "node --loader ts-node/esm src/agent.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}
