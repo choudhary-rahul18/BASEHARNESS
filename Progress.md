@@ -157,3 +157,98 @@ The core principle: **the harness must verify outcomes in code. It cannot trust 
 | No auth/session handling | Harness detects login redirects by URL pattern and either injects credentials or flags as unrecoverable |
 | Wasted steps not detected | Harness tracks URL + DOM fingerprint across steps; if nothing changed, flag as a stuck loop |
 | No progress signal | Harness scores each step: did the URL change? Did a key element appear/disappear? If N steps pass with no change → intervene |
+
+---
+
+## Session 3 — 2026-06-11
+
+### What We Built
+Three additions on top of the Naked Agent:
+
+1. **Deterministic Verifier** — after `done()`, the harness checks final page state in code (URL regex, title regex) and prints an explicit `PASSED / FAILED` verdict. No second LLM call — pure software engineering.
+2. **Mid-loop Guards** — every step, before the LLM is consulted, the harness runs: auth wall detector, stuck loop detector, error page detector.
+3. **LLM Adapter Layer** — a provider abstraction that lets the supervisor loop swap between Anthropic and Ollama by changing one env var (`LLM_PROVIDER`). The loop has zero knowledge of which provider is active.
+
+---
+
+### Files Created / Changed
+| File | Purpose |
+|---|---|
+| `src/llmAdapter.ts` | NEW: Adapter pattern — `AnthropicAdapter` and `OllamaAdapter` behind a single `LLMAdapter` interface. `createAdapter(provider, systemPrompt)` factory. |
+| `src/agent.ts` | Added verifiers (`isAuthWall`, `isErrorPage`, `isStuckLoop`, `verifyOutcome`). Replaced all Anthropic-specific LLM code with `adapter.getNextAction()`. |
+| `.env` | Added `OLLAMA_API_KEY` and `LLM_PROVIDER` |
+
+---
+
+### Architecture: Updated with Adapter Layer
+```
+┌──────────────────────────────────────────────────┐
+│  Supervisor Loop (agent.ts)                      │
+│  while step < MAX_STEPS:                         │
+│    1. Harness Checks (auth wall, stuck, error)   │
+│    2. adapter.getNextAction() → tool call        │
+│    3. Tool Registry → Playwright action          │
+│  after done(): verifyOutcome() → PASSED/FAILED   │
+└─────────────────┬────────────────────────────────┘
+                  │
+         ┌────────┴────────┐
+         ▼                 ▼
+  AnthropicAdapter    OllamaAdapter
+  (Anthropic SDK,     (fetch to ollama.com/api/chat,
+   tool_use blocks,    tool_calls array,
+   tool_result IDs)    no ID pairing)
+```
+
+---
+
+### Key Design Principle Established
+**Verification must be code, not LLM.** Using a second LLM to verify the first LLM adds cost, latency, and another failure point. The harness verifies by checking observable, measurable state — URL patterns, page titles, DOM presence — the same way a traditional software test would.
+
+---
+
+### Concepts Learned
+
+#### Adapter Pattern
+- A thin abstraction that normalises different provider APIs into one interface.
+- The loop calls `adapter.getNextAction({ url, title, tree })` and gets back `{ toolName, toolInput, reasoning }`.
+- Each adapter owns its own message history, schema translation, and response parsing internally.
+- Adding a new provider = one new class + one line in the factory. The loop never changes.
+
+#### Transition-Based vs State-Based Checking
+- State-based: "what URL am I on?" — can't distinguish blocked from passing through.
+- Transition-based: "what action caused this URL?" — needs `(prev_action, current_url)` pair.
+- The harness records every dispatched tool call, giving it ground truth for transition checks.
+
+#### Why LLM Behaviour Cannot Be a Safety Mechanism
+- Claude (Anthropic Haiku) gracefully reported failure at the auth wall — because its training told it to stop at authorization barriers without credentials.
+- Ministral 3B hallucinated success at the same wall — claimed "Successfully upvoted" while sitting on `vote?id=...`.
+- The harness produced `FAILED` for both. Swapping models changed the agent's behaviour; it did not change the harness verdict.
+
+---
+
+### Test Runs
+
+#### Test 3 — HN Upvote, Anthropic Haiku, with verifier + "Make sure to complete the task" prompt
+- Step 1: `click(10)` — upvote arrow clicked
+- Step 2: Auth wall URL. Harness warned. Claude called `done("login required — task incomplete")`.
+- Verifier: `FAILED — Blocked by authentication wall.`
+- **Result:** Agent was honest; harness correctly confirmed failure. ✅ Verifier working.
+
+#### Test 4 — HN Upvote, Ministral 3B (Ollama), with verifier
+- Step 1: `click(10)` — upvote arrow clicked
+- Step 2: Auth wall URL. Harness warned. Ministral called `done()` with hallucinated success AND malformed JSON (`"reason: The top story..."` as key instead of `"reason"`).
+- Verifier: `FAILED — Blocked by authentication wall.` (regardless of malformed claim)
+- **Key finding:** Small model (3B) hallucinated success + produced structurally broken tool call JSON. Harness caught it anyway.
+
+---
+
+### Failure Modes — Updated
+
+| # | Failure Mode | Observed In | Harness Response |
+|---|---|---|---|
+| Wasted steps | Anthropic — clicked before typing | Warning log only (no guard yet) |
+| Blind `done()` acceptance | Fixed — `verifyOutcome()` runs on every `done()` | PASSED/FAILED verdict |
+| Auth wall undetected | Fixed — `isAuthWall()` runs every step | WARNING log + caught in verifier |
+| Stuck loop | Fixed — `isStuckLoop()` runs every step | Stops loop after 3 identical URLs |
+| Hallucinated success | Ministral 3B — claimed upvote succeeded | Verifier overruled it: FAILED |
+| Malformed tool call JSON | Ministral 3B — key contained value text | `toolInput['reason']` was undefined; harness didn't crash |
