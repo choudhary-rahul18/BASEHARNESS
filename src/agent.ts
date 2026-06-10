@@ -3,6 +3,7 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { extractDOM } from './domExtractor.js';
 import { toolRegistry } from './tools.js';
 import { createAdapter, Provider } from './llmAdapter.js';
+import { HackerNewsLoginHandler } from './loginHandler.js';
 
 // ── System Prompt ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a browser automation agent.
@@ -33,7 +34,7 @@ function isStuckLoop(urlHistory: string[], window = 3): boolean {
 }
 
 // Called after done(). Checks final page state and prints PASSED / FAILED.
-async function verifyOutcome(page: Page, agentReason: string): Promise<void> {
+async function verifyOutcome(page: Page, agentReason: string, votedStoryId: string | null): Promise<void> {
   const url   = page.url();
   const title = await page.title();
 
@@ -49,6 +50,20 @@ async function verifyOutcome(page: Page, agentReason: string): Promise<void> {
     console.log('         The claimed action was never completed.');
   } else if (isErrorPage(title)) {
     console.log('[VERIFY] FAILED — Agent ended on an error page.');
+  } else if (votedStoryId) {
+    // DOM-state verification: HN removes the active upvote anchor once a vote is cast.
+    // Navigate to the front page so the story is in the DOM, then check the link.
+    await page.goto('https://news.ycombinator.com');
+    await page.waitForLoadState('networkidle');
+    // After voting, HN keeps the upvote <a> in the DOM but adds class="nosee"
+    // (visually grayed out, no longer clickable). Only count links that are still
+    // active — i.e. NOT carrying the nosee class.
+    const activeVoteLinks = await page.locator(`a[href*="vote?id=${votedStoryId}&how=up"]:not(.nosee)`).count();
+    if (activeVoteLinks > 0) {
+      console.log(`[VERIFY] FAILED — Active upvote link still present for story ${votedStoryId}. Vote did not register.`);
+    } else {
+      console.log(`[VERIFY] PASSED — Upvote confirmed: vote link is nosee (voted) for story ${votedStoryId}.`);
+    }
   } else {
     console.log('[VERIFY] PASSED — No known failure patterns detected.');
   }
@@ -77,6 +92,11 @@ async function verifyOutcome(page: Page, agentReason: string): Promise<void> {
 
     const urlHistory: string[] = [];
 
+    // Interception gate — handles auth walls in harness code, invisible to the LLM.
+    const loginHandler = new HackerNewsLoginHandler();
+    let loginAttempted = false;
+    let votedStoryId: string | null = null;
+
     for (let step = 0; step < MAX_STEPS; step++) {
       console.log(`\n━━━ Step ${step + 1} / ${MAX_STEPS} ${'━'.repeat(40)}`);
 
@@ -91,7 +111,41 @@ async function verifyOutcome(page: Page, agentReason: string): Promise<void> {
       urlHistory.push(url);
 
       if (isAuthWall(url)) {
-        console.log('[HARNESS] WARNING — Auth wall detected. Letting agent continue...');
+        // Extract story ID from vote URL for later DOM-state verification.
+        const idMatch = url.match(/vote\?id=(\d+)/);
+        if (idMatch) votedStoryId = idMatch[1];
+
+        if (!loginAttempted && loginHandler.canHandle(url)) {
+          loginAttempted = true;
+          console.log('[HARNESS] Auth wall detected — attempting harness-driven login...');
+          // Return to START_URL after login — the front page has authenticated vote
+          // links (with auth= tokens). The unauthenticated URL we intercepted lacks
+          // those tokens, so replaying it directly silently fails.
+          const success = await loginHandler.login(page, START_URL);
+          if (!success) {
+            console.log('[HARNESS] Login failed. Cannot recover. Stopping.');
+            break;
+          }
+          // If the auth wall was a vote redirect, click the authenticated upvote
+          // link now that we're on the logged-in front page. The harness does this
+          // in Playwright code — the LLM is not involved.
+          if (votedStoryId) {
+            console.log(`[HARNESS] Replaying upvote for story ${votedStoryId} via authenticated link...`);
+            const voteLocator = page.locator(`a[href*="vote?id=${votedStoryId}&how=up"]`);
+            if (await voteLocator.count() > 0) {
+              await voteLocator.first().click();
+              await page.waitForLoadState('networkidle');
+              console.log('[HARNESS] Upvote replayed. Returning to front page.');
+              await page.goto(START_URL);
+              await page.waitForLoadState('networkidle');
+            } else {
+              console.log('[HARNESS] Upvote link not found — story may already be voted or off front page.');
+            }
+          }
+          console.log('[HARNESS] Resuming task.');
+          continue;  // skip LLM call; next iteration observes the logged-in page
+        }
+        console.log('[HARNESS] WARNING — Auth wall detected. No handler available or login already attempted.');
       }
       if (isStuckLoop(urlHistory)) {
         console.log('[HARNESS] STUCK — URL unchanged for 3 consecutive steps. Stopping.');
@@ -118,7 +172,7 @@ async function verifyOutcome(page: Page, agentReason: string): Promise<void> {
       console.log(`[LLM] Chose tool: ${toolName}(${JSON.stringify(toolInput)})`);
 
       if (toolName === 'done') {
-        await verifyOutcome(page, String(toolInput['reason'] ?? ''));
+        await verifyOutcome(page, String(toolInput['reason'] ?? ''), votedStoryId);
         break;
       }
 

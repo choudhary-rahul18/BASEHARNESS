@@ -58,7 +58,7 @@ class AnthropicAdapter implements LLMAdapter {
     }
 
     const response = await this.client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
       system: this.systemPrompt,
       messages: this.messages,
@@ -145,7 +145,7 @@ class OllamaAdapter implements LLMAdapter {
         'Authorization': `Bearer ${process.env.OLLAMA_API_KEY}`,
       },
       body: JSON.stringify({
-        model: 'ministral-3:3b',
+        model: process.env.OLLAMA_MODEL ?? 'ministral-3:3b',
         messages: this.messages,
         tools: this.tools,
         stream: false,

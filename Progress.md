@@ -252,3 +252,111 @@ Three additions on top of the Naked Agent:
 | Stuck loop | Fixed — `isStuckLoop()` runs every step | Stops loop after 3 identical URLs |
 | Hallucinated success | Ministral 3B — claimed upvote succeeded | Verifier overruled it: FAILED |
 | Malformed tool call JSON | Ministral 3B — key contained value text | `toolInput['reason']` was undefined; harness didn't crash |
+
+---
+
+## Session 4 — 2026-06-11
+
+### What We Built
+The **Harness Interception Gate** — a login middleware that handles authentication entirely in deterministic Playwright code. The LLM has no login tool, no knowledge of credentials, and never sees the auth wall URL in its message history.
+
+---
+
+### Files Created / Changed
+| File | Purpose |
+|---|---|
+| `src/loginHandler.ts` | NEW: `LoginHandler` interface + `HackerNewsLoginHandler`. Reads credentials from `process.env` directly inside `.fill()` calls — never assigned to a named variable. |
+| `src/agent.ts` | Added interception gate: when auth wall detected, harness logs in, replays upvote via authenticated DOM link, then resumes loop. Added `votedStoryId` tracking and DOM-state verifier. |
+
+---
+
+### Architecture: Updated with Interception Gate
+```
+┌──────────────────────────────────────────────────────────┐
+│  Supervisor Loop (agent.ts)                              │
+│  while step < MAX_STEPS:                                 │
+│    1. Harness Checks:                                    │
+│       • Auth wall detected?                              │
+│           → loginHandler.login(page, START_URL)          │
+│           → replay upvote via authenticated DOM link     │
+│           → continue (LLM skips this step entirely)      │
+│       • Stuck loop / error page → stop                   │
+│    2. adapter.getNextAction() → tool call                │
+│    3. Tool Registry → Playwright action                  │
+│  after done(): verifyOutcome() → DOM-state check         │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Key Design Principle Established
+**Smart harness + dumb LLM > dumb harness + smart LLM.**
+
+Ministral 3B (a 3B-parameter model) completed the task correctly today. The same model hallucinated success in Session 3. The difference: the harness now handles every critical action deterministically. The LLM only had to identify the upvote arrow — the rest was code.
+
+---
+
+### Security Guarantees of the Interception Gate
+1. Credentials read from `process.env` directly in `.fill()` — never stored in a named variable during LLM calls
+2. No `login` tool in `toolSchemas` — prompt injection cannot cause credential leakage via a tool call argument
+3. LLM message history skips the auth wall URL entirely — harness intercepts before `getNextAction()` is called
+4. `tool_result` the LLM sees: `"Action executed successfully."` — no mention of login, credentials, or auth walls
+
+---
+
+### Concepts Learned
+
+#### HN Vote URL Has a Session-Specific `auth=` Token
+- Unauthenticated vote URL: `vote?id=48480978&how=up&goto=news`
+- Authenticated vote URL: `vote?id=48480978&how=up&auth=a3f9bc...&goto=news`
+- Replaying the unauthenticated URL after login silently fails — HN rejects it without error
+- Fix: after login, read the live DOM for the authenticated link and click it via Playwright
+
+#### HN Signals "Voted" via CSS Class, Not DOM Removal
+- After voting, HN adds `class="nosee"` to the upvote `<a>` tag — doesn't remove the element
+- Checking for the element's presence always returns true, voted or not
+- Correct verifier: `a[href*="vote?id=...&how=up"]:not(.nosee)` — only counts visible, clickable links
+
+#### Two Forms with Identical `name=` Attributes
+- HN's login page has two forms (login + create account) both with `input[name="acct"]`
+- Playwright's strict mode rejects locators that resolve to multiple elements
+- Fix: `.first()` scopes to the login form, which is always first in the DOM
+
+#### Transition from URL-Based to DOM-State Verification
+- URL check (`isAuthWall`) detects failure categories
+- DOM-state check (`nosee` class) confirms actual task completion
+- These are different layers: URL tells you where you are; DOM tells you what happened
+
+---
+
+### Bugs Hit & Fixed (Session 4)
+
+| Bug | Cause | Fix |
+|---|---|---|
+| `locator.fill: strict mode violation` | HN login page has two forms with `name="acct"` | `.first()` on all login locators |
+| Vote never registered after login | Unauthenticated vote URL lacks `auth=` token | Read live DOM post-login; click authenticated link |
+| Verifier false negative (`FAILED` on real success) | HN keeps upvote `<a>` with `nosee` class after voting | `:not(.nosee)` in verifier selector |
+
+---
+
+### Test Runs
+
+#### Test 5 — HN Upvote, Ministral 3B (Ollama), with Interception Gate
+- Step 1: `click(10)` — upvote arrow clicked (logged out)
+- Step 2: Auth wall URL. **Harness intercepted.** Logged in → found authenticated vote link → clicked it → returned to front page. LLM was not called this step.
+- Step 3: LLM saw logged-in HN page → called `done("Upvoted...")`
+- Verifier: navigated to front page → `a[href*="vote?id=48480978&how=up"]:not(.nosee)` → count = 0 → `PASSED`
+- **Confirmed in browser:** Upvote registered on the actual HN account. ✅
+- **Key result:** Ministral 3B succeeded because the harness handled every critical action. The LLM only picked the right element.
+
+---
+
+### Failure Modes — Updated
+
+| # | Failure Mode | Harness Response |
+|---|---|---|
+| Blind `done()` acceptance | Fixed — `verifyOutcome()` with DOM-state check | PASSED/FAILED via `:not(.nosee)` selector |
+| Auth wall — login required | Fixed — Interception Gate logs in silently | Credentials never touch LLM |
+| Auth wall — `auth=` token missing | Fixed — Harness reads authenticated link from live DOM | Upvote replayed correctly |
+| Stuck loop | Fixed — `isStuckLoop()` runs every step | Stops after 3 identical URLs |
+| Hallucinated success | Harness overrules LLM claim | DOM-state verifier is ground truth |
